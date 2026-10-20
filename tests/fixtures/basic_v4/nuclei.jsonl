@@ -1,0 +1,1 @@
+{"template-id":"CVE-2021-1","host":"10.0.1.5","ip":"10.0.1.5","url":"http://10.0.1.5:80","severity":"high","info":{"name":"RCE","classification":{"cve-id":["CVE-2021-1"]}}}

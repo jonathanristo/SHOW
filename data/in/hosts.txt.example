@@ -1,0 +1,4 @@
+# Optional explicit hosts, unioned with subnets.txt. One IP or hostname per line.
+# Copy this file to  hosts.txt  (git-ignored) to use it.
+# 10.0.1.10
+# dc01.corp.local

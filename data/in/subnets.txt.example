@@ -1,0 +1,11 @@
+# SHOW targets — one per line. Supports:
+#   single IP     10.0.1.50
+#   CIDR (any)    192.168.1.0/24
+#                 10.0.0.0/16
+#   hostname      fileserver.corp.local
+# '#' comments and blank lines are ignored.
+#
+# Copy this file to  subnets.txt  and edit. subnets.txt is git-ignored because
+# internal target lists are sensitive.
+10.0.1.0/24
+192.168.1.0/24

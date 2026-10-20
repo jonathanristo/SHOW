@@ -1,0 +1,1 @@
+{"source_module":"SHOW","source_tool":"nmap","scan_id":"TS","observed_at":"TS","ip_at_observation_time":"2001:db8::10","hostname_at_observation_time":null,"hostname_resolvable":null,"port":443,"protocol":"tcp","state":"open","service":"https","product":"nginx","version":"1.25","extra_info":null,"banner":null,"cpe":[]}

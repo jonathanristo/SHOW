@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SHOW — Security Host Observation & Weakness Detection
+# Internal network exposure sensor. This file is the primary place to tune SHOW;
+# every knob is commented with its effect and safe range. See the README
+# "Configuration" section for worked scenarios.
+# ─────────────────────────────────────────────────────────────────────────────
+brand: "SHOW"
+
+inputs:
+  # Scan targets — ONE per line. Supports single IP (10.0.1.50), CIDR of any size
+  # (192.168.1.0/24, 10.0.0.0/16), or hostname. '#' comments and blank lines ignored.
+  # Internal target lists are sensitive → this file is git-ignored (ship .example).
+  targets_file: "./data/in/subnets.txt"
+  # Optional explicit hosts, unioned with targets_file. One IP/hostname per line.
+  hosts_file: "./data/in/hosts.txt"
+
+scan:
+  # ── masscan — primary fast SYN sweep (works across ROUTED networks) ──────────
+  masscan:
+    rate: 10000            # packets/sec (~10 Mbps). Lower on fragile/legacy/IDS-monitored
+                           #   nets: 5000 (~5 Mbps) conservative; 50000 aggressive (loud).
+    # masscan has no nmap-style "top-N"; give it an explicit port spec. Default = common
+    # internal service ports (web, DBs, RDP/SMB/WinRM, caches). Edit to taste.
+    ports: "1-1024,1433,1521,2049,3000,3306,3389,5432,5900,5985,5986,6379,8000,8006,8008,8080,8081,8443,8888,9000,9090,9200,9443,11211,27017"
+    full_ports: "0-65535"  # used by `run weekly` sweep only (all 65,535 ports; slow/loud).
+    exclude_private: false # true = skip RFC1918 ranges (rarely wanted on an internal sensor).
+
+  # ── L2 enrichment — LOCAL broadcast domain only (cannot cross a router) ───────
+  arp_scan:
+    enable: true           # adds `mac` to same-segment hosts. Best-effort; never gates the run.
+  nbtscan:
+    enable: true           # adds `netbios` (Windows/NetBIOS name), UDP/137. Best-effort.
+
+  # ── nmap — service/version detection on discovered host:port ─────────────────
+  nmap:
+    timing: "T4"           # T0 paranoid … T5 insane. T3–T4 = internal sweet spot.
+    version_intensity: "light"   # "light" = fast -sV; "full" = deeper, slower probes.
+
+  # ── httpx — HTTP(S) probe / title / tech detect ─────────────────────────────
+  httpx:
+    rate_limit: 400        # requests/sec cap.
+
+  # ── nuclei — template-based vulnerability scan ──────────────────────────────
+  nuclei:
+    severity_daily: "high,critical"          # daily = fast, high-signal only.
+    severity_weekly: "medium,high,critical"  # weekly sweep widens the net.
+    rate_limit: 200
+    concurrency: 50
+
+  # ── testssl — TLS/SSL assessment (live HTTPS only) ──────────────────────────
+  tls:
+    testssl: true          # runs --fast on discovered HTTPS services.
+
+# ── gowitness — screenshots of discovered web services ──────────────────────────
+screenshots:
+  enable: true
+  gowitness:
+    workers: 10            # parallel headless-Chromium workers.
+    delay: 0               # seconds to wait before capturing each page.
+
+output:
+  root: "./data/out"       # timestamped run dirs land here (data/out/YYYYMMDDTHHMMSSZ/, UTC).

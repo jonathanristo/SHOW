@@ -1,0 +1,3 @@
+<?xml version="1.0"?><nmaprun><host><address addr="2001:db8::10" addrtype="ipv6"/>
+<os><osmatch name="Linux" accuracy="90"/></os>
+<ports><port protocol="tcp" portid="443"><state state="open"/><service name="https" product="nginx" version="1.25"/></port></ports></host></nmaprun>

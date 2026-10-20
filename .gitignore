@@ -1,0 +1,108 @@
+# Secrets and Credentials
+data/creds/
+data/.config/subfinder/provider-config.yaml
+*.env
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# API Keys and Tokens
+**/api-keys.yaml
+**/tokens.txt
+**/*_token
+**/*_secret
+**/*credentials*
+
+# Scan Outputs + runtime tool config (users/containers generate their own)
+data/out/
+data/.cache/
+data/.config/
+
+# Input target lists — sensitive (internal IPs/subnets). Ignore real files, ship examples.
+data/in/subnets.txt
+data/in/hosts.txt
+!data/in/subnets.txt.example
+!data/in/hosts.txt.example
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+.project
+.settings/
+.classpath
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Logs
+*.log
+logs/
+*.out
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# Python (if you add any Python scripts later)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Node.js (if you add any JS tooling)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# macOS
+*.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# UNCOVER docs directory
+UNCOVER_docs/
+UNCOVER_docs
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk

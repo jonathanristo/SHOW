@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# tests/lib.bash — shared helpers for the SHOW test suite.
+#
+# Bash-only: showctl is bash and we source it for its parser functions; zsh does not populate
+# BASH_SOURCE / arrays the same way. Mirrors STRIP's tests/lib.bash so the two suites read alike.
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$TESTS_DIR/.." && pwd)"
+SHOWCTL="$REPO/showctl"
+NORMALIZE="$REPO/scripts/normalize.py"
+
+# Redirect Python bytecode to a writable temp — some sandboxes make the default cache (e.g. macOS
+# ~/Library/Caches) unwritable, which would make `py_compile` and importing normalize.py fail.
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-${TMPDIR:-/tmp}/show_pycache}"
+
+# colour only on a TTY
+if [[ -t 1 ]]; then C_G=$'\033[32m'; C_R=$'\033[31m'; C_Y=$'\033[33m'; C_B=$'\033[1m'; C_0=$'\033[0m'
+else C_G=''; C_R=''; C_Y=''; C_B=''; C_0=''; fi
+
+TESTS_RUN=0; TESTS_PASS=0; TESTS_FAIL=0; TESTS_SKIP=0
+
+pass(){ TESTS_RUN=$((TESTS_RUN+1)); TESTS_PASS=$((TESTS_PASS+1)); printf '  %sok%s   %s\n' "$C_G" "$C_0" "$1"; }
+fail(){ TESTS_RUN=$((TESTS_RUN+1)); TESTS_FAIL=$((TESTS_FAIL+1)); printf '  %sFAIL%s %s\n' "$C_R" "$C_0" "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; return 0; }
+skip(){ TESTS_RUN=$((TESTS_RUN+1)); TESTS_SKIP=$((TESTS_SKIP+1)); printf '  %sskip%s %s%s\n' "$C_Y" "$C_0" "$1" "${2:+ — $2}"; }
+
+assert_eq(){        # desc  expected  actual
+  if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1" "expected [$2] got [$3]"; fi
+}
+assert_contains(){  # desc  haystack  needle
+  case "$2" in *"$3"*) pass "$1";; *) fail "$1" "[$2] missing [$3]";; esac
+}
+assert_ok(){        # desc  cmd...    (expect success)
+  local d="$1"; shift
+  if "$@" >/dev/null 2>&1; then pass "$d"; else fail "$d" "command failed: $*"; fi
+}
+assert_fail(){      # desc  cmd...    (expect failure)
+  local d="$1"; shift
+  if "$@" >/dev/null 2>&1; then fail "$d" "command unexpectedly succeeded: $*"; else pass "$d"; fi
+}
+
+summary(){          # label  → prints tally, returns non-zero if any failed
+  echo
+  printf '%s%s%s: %d run — %s%d passed%s, %s%d failed%s, %d skipped\n' \
+    "$C_B" "${1:-tests}" "$C_0" "$TESTS_RUN" "$C_G" "$TESTS_PASS" "$C_0" "$C_R" "$TESTS_FAIL" "$C_0" "$TESTS_SKIP"
+  [[ $TESTS_FAIL -eq 0 ]]
+}
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+docker_ok(){ have docker && docker info >/dev/null 2>&1; }
+
+# Load showctl's pure transform functions (sh_*) without side effects — SHOW_TEST_MODE=1 skips the
+# run-dir mkdir and the CLI dispatch, so `source showctl` defines functions and returns.
+load_parsers(){ SHOW_TEST_MODE=1 source "$SHOWCTL"; }
+
+# Blank volatile envelope fields so NDJSON golden comparisons are stable regardless of scan time.
+normalize_ndjson(){
+  jq -c '
+    if type=="object" then
+      (if has("scan_id")     then .scan_id="TS"     else . end)
+      | (if has("observed_at") then .observed_at="TS" else . end)
+    else . end'
+}

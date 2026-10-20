@@ -1,0 +1,3 @@
+<?xml version="1.0"?><nmaprun><host><address addr="10.0.1.5" addrtype="ipv4"/>
+<os><osmatch name="Linux 5.x" accuracy="95"/></os>
+<ports><port protocol="tcp" portid="80"><state state="open"/><service name="http" product="nginx" version="1.25.3"><cpe>cpe:/a:nginx:nginx:1.25.3</cpe></service></port></ports></host></nmaprun>

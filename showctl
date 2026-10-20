@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SHOW_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CFG="$SHOW_HOME/show.yaml"
+OUTROOT="$(yq -r '.output.root' "$CFG")"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"           # UTC basic — run directory (filesystem/Windows-safe)
+SCAN_ID="$(date -u +%Y-%m-%dT%H:%M:%SZ)"  # ISO-8601 UTC — scan_id + observed_at on every record
+START_EPOCH="$(date +%s)"
+OUT="$SHOW_HOME/${OUTROOT#./}/$TS"
+[[ "${SHOW_TEST_MODE:-0}" == "1" ]] || mkdir -p "$OUT"   # tests source showctl for functions only
+NORMALIZE_OK=1                             # cleared if the normalizer fails → run exits non-zero
+DEGRADED_TOOLS=""                          # primary tools that exited non-zero → manifest status "degraded"
+
+compose(){ docker compose -f "$SHOW_HOME/docker-compose.show.yml" "$@"; }
+# stdin-safe tool runner: -T (no TTY) + stdin from /dev/null so a container tool
+# can never block waiting on stdin (the STRIP dnsx-hang class). Use for every tool call.
+crun(){ compose run -T --rm "$@" </dev/null; }
+# newest run dir by NAME (TS, mtime-independent), skipping empty/aborted dirs (e.g. the fresh startup dir)
+latest_run(){
+  local d
+  while IFS= read -r d; do
+    [[ -n "$(ls -A "$d" 2>/dev/null)" ]] && { printf '%s\n' "$d"; return 0; }
+  done < <(ls -d "$SHOW_HOME/${OUTROOT#./}"/*/ 2>/dev/null | sort -r)
+}
+yqg(){ yq -r "$1" "$CFG"; }
+log(){ echo "[SHOW $(date +%H:%M:%S)] $*"; }
+need(){ [[ -f "$1" ]] || { echo "Missing $1"; exit 1; }; }
+
+# ── Pure transforms (stdin→stdout; unit-tested in tests/20_parsers.sh — no drift) ──
+sh_hostports(){ awk '$1=="open"{ip=$4; if(ip ~ /:/) print "["ip"]:"$3; else print ip":"$3}'; }  # masscan.list → host:port (IPv6 bracketed)
+sh_ports(){ sed -E 's/.*:([0-9]+)$/\1/'; }                                                       # host:port → port (last-colon, IPv6-safe)
+sh_urls(){ awk -F: 'NF>=2 { port=$NF; host=substr($0,1,length($0)-length($NF)-1);
+                            if (host!="" && port ~ /^[0-9]+$/) { print "http://"host":"port; print "https://"host":"port } }'; }
+sh_family(){ if [[ "${1:-4}" == 6 ]]; then grep ':'; else grep -v ':'; fi; }                     # hosts_alive → v4 (default) | v6
+
+# Record a primary-tool failure without aborting the run — the manifest then reports status:"degraded"
+# instead of a false "ok" over empty output (a || true swallows the failure otherwise).
+mark_degraded(){ DEGRADED_TOOLS="${DEGRADED_TOOLS:+$DEGRADED_TOOLS }$1"; log "[✗] $1 failed (exit ${2:-?}) — continuing; run marked degraded"; return 0; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Setup — build the discovery image + download Nuclei templates into a volume
+# ─────────────────────────────────────────────────────────────────────────────
+setup(){
+  echo "═══════════════════════════════════════════════"
+  echo "  SHOW Initial Setup"
+  echo "═══════════════════════════════════════════════"
+  echo ""
+  log "Building discovery image (masscan / arp-scan / nbtscan)…"
+  compose build discovery
+
+  log "Creating Docker volume for Nuclei templates…"
+  docker volume create nuclei-templates >/dev/null 2>&1 || true
+
+  log "Downloading Nuclei templates (2–5 min on first run)…"
+  docker run --rm -v nuclei-templates:/root/nuclei-templates \
+    projectdiscovery/nuclei:latest -update-templates
+
+  local n
+  n="$(docker run --rm -v nuclei-templates:/root/nuclei-templates alpine:latest \
+        find /root/nuclei-templates -name '*.yaml' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${n:-0}" -gt 1000 ]]; then
+    echo ""; log "✓ Setup complete — $n nuclei templates installed."
+    echo ""; echo "Next: sudo ./showctl run daily"; echo ""
+  else
+    echo ""; echo "[ERR] Setup failed — only ${n:-0} templates found (expected 10,000+)"; exit 1
+  fi
+}
+
+ensure_nuclei_templates(){
+  if ! docker volume inspect nuclei-templates >/dev/null 2>&1; then
+    log "⚠ Nuclei templates volume not found — running first-time setup…"; setup; return
+  fi
+  local n
+  n="$(docker run --rm -v nuclei-templates:/root/nuclei-templates alpine:latest \
+        find /root/nuclei-templates -name '*.yaml' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${n:-0}" -lt 1000 ]]; then
+    log "⚠ Nuclei templates incomplete ($n) — running setup…"; setup
+  else
+    log "✓ Nuclei templates found ($n)"
+  fi
+}
+
+ensure_discovery_image(){
+  docker image inspect show/discovery:latest >/dev/null 2>&1 \
+    || { log "Discovery image missing — building…"; compose build discovery; }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input classification — one target per line: IP | CIDR | hostname
+# Hostnames are resolved to IPs (masscan needs IPs); the union feeds masscan.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_inputs(){
+  local tf hf
+  tf="$SHOW_HOME/$(yqg '.inputs.targets_file' | sed 's#^\./##')"
+  hf="$SHOW_HOME/$(yqg '.inputs.hosts_file'   | sed 's#^\./##')"
+  need "$tf"
+
+  : > "$OUT/in_ips.txt"; : > "$OUT/in_cidrs.txt"; : > "$OUT/in_hosts.txt"
+  { cat "$tf"; [[ -f "$hf" ]] && cat "$hf"; } 2>/dev/null | while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [[ -z "$line" ]] && continue
+    if   [[ "$line" == */* ]]; then printf '%s\n' "$line" >> "$OUT/in_cidrs.txt"        # IPv4/IPv6 CIDR
+    elif [[ "$line" == *:* ]]; then printf '%s\n' "$line" >> "$OUT/in_ips.txt"          # IPv6 literal
+    elif [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then printf '%s\n' "$line" >> "$OUT/in_ips.txt"  # IPv4
+    else printf '%s\n' "$line" >> "$OUT/in_hosts.txt"                                    # hostname
+    fi
+  done
+
+  # Resolve hostnames → IPs (best-effort; masscan can't scan a name).
+  # host_context.tsv (ip\thostname\tresolvable) feeds the normalizer's envelope
+  # (ip/hostname_at_observation_time + hostname_resolvable).
+  : > "$OUT/resolved_hosts.txt"; : > "$OUT/host_context.tsv"
+  if [[ -s "$OUT/in_hosts.txt" ]]; then
+    while IFS= read -r h; do
+      local ips
+      ips="$(getent ahosts "$h" 2>/dev/null | awk '{print $1}' | sort -u)"   # A + AAAA
+      if [[ -n "$ips" ]]; then
+        printf '%s\n' "$ips" >> "$OUT/resolved_hosts.txt"
+        while IFS= read -r ip; do
+          [[ -n "$ip" ]] && printf '%s\t%s\ttrue\n' "$ip" "$h" >> "$OUT/host_context.tsv"
+        done <<< "$ips"
+      else
+        log "resolve: $h → (none)"
+        printf '\t%s\tfalse\n' "$h" >> "$OUT/host_context.tsv"
+      fi
+    done < "$OUT/in_hosts.txt"
+  fi
+
+  cat "$OUT/in_ips.txt" "$OUT/in_cidrs.txt" "$OUT/resolved_hosts.txt" 2>/dev/null | sort -u > "$OUT/targets_all.txt"
+  log "inputs → ips:$(wc -l <"$OUT/in_ips.txt"|tr -d ' ') cidrs:$(wc -l <"$OUT/in_cidrs.txt"|tr -d ' ') hosts:$(wc -l <"$OUT/in_hosts.txt"|tr -d ' ') → targets:$(wc -l <"$OUT/targets_all.txt"|tr -d ' ')"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Discover — masscan sweep → arp/nbt enrichment → nmap service detect → httpx
+# ─────────────────────────────────────────────────────────────────────────────
+discover(){
+  local mode="${1:-}"                       # "sweep" = weekly (full-port masscan)
+  log "Output → $OUT"
+  classify_inputs
+  [[ -s "$OUT/targets_all.txt" ]] || { log "no scan targets — nothing to scan"; return 0; }
+
+  # ── masscan: fast SYN sweep ────────────────────────────────────────────────
+  local ports
+  if [[ "$mode" == "sweep" ]]; then ports="$(yqg '.scan.masscan.full_ports')"; else ports="$(yqg '.scan.masscan.ports')"; fi
+  local excl=() eopt=()
+  [[ "$(yqg '.scan.masscan.exclude_private')" == "true" ]] && excl=(--exclude 10.0.0.0/8 --exclude 172.16.0.0/12 --exclude 192.168.0.0/16)
+  [[ -n "${SHOW_IFACE:-}" ]] && eopt=(-e "$SHOW_IFACE")
+  log "masscan (-p ${ports}, rate $(yqg '.scan.masscan.rate'))…"
+  crun discovery masscan -p"$ports" --rate "$(yqg '.scan.masscan.rate')" \
+    "${eopt[@]}" "${excl[@]}" -iL "/data/out/$TS/targets_all.txt" \
+    -oL "/data/out/$TS/masscan.list" || mark_degraded masscan $?
+  # host:port (IPv6 bracketed), alive hosts, v4/v6 splits — via the pure transforms above
+  { cat "$OUT/masscan.list" 2>/dev/null || true; } | sh_hostports              | sort -u > "$OUT/hosts_ports.txt"
+  { cat "$OUT/masscan.list" 2>/dev/null || true; } | awk '$1=="open"{print $4}' | sort -u > "$OUT/hosts_alive.txt"
+  sh_family 4 < "$OUT/hosts_alive.txt" | sort -u > "$OUT/hosts_alive_v4.txt" || :
+  sh_family 6 < "$OUT/hosts_alive.txt" | sort -u > "$OUT/hosts_alive_v6.txt" || :
+  log "masscan → $(wc -l <"$OUT/hosts_ports.txt"|tr -d ' ') open host:port across $(wc -l <"$OUT/hosts_alive.txt"|tr -d ' ') hosts"
+
+  # ── arp-scan: local-segment MAC enrichment (best-effort; can't cross a router) ─
+  if [[ "$(yqg '.scan.arp_scan.enable')" == "true" ]]; then
+    log "arp-scan (local segment)…"
+    crun discovery arp-scan --localnet ${SHOW_IFACE:+--interface="$SHOW_IFACE"} > "$OUT/arp.raw" 2>/dev/null || true
+    awk -F'\t' '$1 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {print $1"\t"$2}' "$OUT/arp.raw" 2>/dev/null | sort -u > "$OUT/arp.tsv" || true
+    log "arp-scan → $(wc -l <"$OUT/arp.tsv" 2>/dev/null|tr -d ' ') MAC(s)"
+  fi
+
+  # ── nbtscan: NetBIOS name enrichment on live hosts (best-effort) ───────────
+  if [[ "$(yqg '.scan.nbtscan.enable')" == "true" && -s "$OUT/hosts_alive_v4.txt" ]]; then
+    log "nbtscan (NetBIOS, IPv4 only)…"
+    crun discovery nbtscan -s '|' -f "/data/out/$TS/hosts_alive_v4.txt" > "$OUT/nbt.raw" 2>/dev/null || true
+    awk -F'|' 'NF>=2 && $1 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ {name=$2; gsub(/^ +| +$/,"",name); if(name!="") print $1"\t"name}' \
+      "$OUT/nbt.raw" 2>/dev/null | sort -u > "$OUT/nbt.tsv" || true
+    log "nbtscan → $(wc -l <"$OUT/nbt.tsv" 2>/dev/null|tr -d ' ') name(s)"
+  fi
+
+  # ── nmap: service/version detection on the ports masscan found ─────────────
+  if [[ -s "$OUT/hosts_alive.txt" ]]; then
+    local pu vi tmg
+    pu="$(sh_ports < "$OUT/hosts_ports.txt" | sort -un | paste -sd, -)"   # last-colon port (IPv6-safe)
+    case "$(yqg '.scan.nmap.version_intensity')" in full) vi="--version-all";; *) vi="--version-light";; esac
+    tmg="-$(yqg '.scan.nmap.timing')"
+    # -Pn: masscan already proved open ports; ping-discovery would wrongly skip non-answering hosts.
+    # IPv4 and IPv6 need separate passes (IPv6 requires -6) → nmap.xml + nmap6.xml.
+    if [[ -s "$OUT/hosts_alive_v4.txt" ]]; then
+      log "nmap v4 -sV -O -Pn ($vi, $tmg) on ${pu:+ports $pu}…"
+      crun nmap nmap -sV -O -Pn "$vi" "$tmg" ${pu:+-p"$pu"} -iL "/data/out/$TS/hosts_alive_v4.txt" \
+        -oX "/data/out/$TS/nmap.xml" -oG "/data/out/$TS/nmap.gnmap" || mark_degraded nmap $?
+    fi
+    if [[ -s "$OUT/hosts_alive_v6.txt" ]]; then
+      log "nmap v6 -6 -sV -O -Pn ($vi, $tmg)…"
+      crun nmap nmap -6 -sV -O -Pn "$vi" "$tmg" ${pu:+-p"$pu"} -iL "/data/out/$TS/hosts_alive_v6.txt" \
+        -oX "/data/out/$TS/nmap6.xml" -oG "/data/out/$TS/nmap6.gnmap" || mark_degraded nmap6 $?
+    fi
+  fi
+
+  # ── httpx: probe discovered host:port for web services ─────────────────────
+  # build URLs (host may be IPv4 / hostname / [IPv6]) via the pure transform
+  sh_urls < "$OUT/hosts_ports.txt" | sort -u > "$OUT/urls.txt"
+  if [[ -s "$OUT/urls.txt" ]]; then
+    log "httpx (probe / title / tech / server / hash)…"
+    crun httpx -l "/data/out/$TS/urls.txt" \
+      -json -silent -status-code -title -tech-detect -rl "$(yqg '.scan.httpx.rate_limit')" \
+      -web-server -content-type -content-length -location -hash sha256 \
+      -o "/data/out/$TS/httpx.json" || mark_degraded httpx $?
+  fi
+
+  log "[✓] SHOW discovery complete."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web/vuln, TLS, screenshots
+# ─────────────────────────────────────────────────────────────────────────────
+webscan(){
+  local sev="${1:-$(yqg '.scan.nuclei.severity_daily')}"
+  # Scan ONLY httpx-validated live URLs — not the raw http+https cross-product (urls.txt),
+  # which would send nuclei at dead schemes/ports. Skip entirely if httpx found nothing live.
+  [[ -s "$OUT/httpx.json" ]] && jq -r 'select((.url // "")|test("^https?://[^/[:space:]]\\S*$")) | .url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/live_urls.txt" || : > "$OUT/live_urls.txt"
+  [[ -s "$OUT/live_urls.txt" ]] || { log "nuclei: no live URLs (httpx found nothing) — skipping"; return 0; }
+  log "nuclei (severity: $sev) on $(wc -l <"$OUT/live_urls.txt"|tr -d ' ') live URL(s)…"
+  crun nuclei -stats -rl "$(yqg '.scan.nuclei.rate_limit')" -c "$(yqg '.scan.nuclei.concurrency')" \
+    -severity "$sev" -ni -jsonl -l "/data/out/$TS/live_urls.txt" -o "/data/out/$TS/nuclei.jsonl" || mark_degraded nuclei $?
+  log "[✓] nuclei done."
+}
+
+tls(){
+  [[ "$(yqg '.scan.tls.testssl')" == "true" ]] || { log "testssl disabled"; return 0; }
+  # HTTPS is derived from the URL scheme (URL-only rows may omit .scheme); the regex requires a host after
+  # :// ([^/[:space:]]) and no trailing junk (\S*$), so http:/// and "…:443 garbage" are rejected.
+  [[ -s "$OUT/httpx.json" ]] && jq -r 'select((.url // "")|test("^https://[^/[:space:]]\\S*$")) | .url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/https_urls.txt" || true
+  [[ -s "$OUT/https_urls.txt" ]] || { log "testssl: no HTTPS services — skipping"; return 0; }
+  log "testssl (--fast) on $(wc -l <"$OUT/https_urls.txt"|tr -d ' ') target(s)…"
+  crun testssl --fast --warnings batch \
+    --file "/data/out/$TS/https_urls.txt" --jsonfile "/data/out/$TS/testssl.json" || mark_degraded testssl $?
+  log "[✓] testssl done."
+}
+
+shots(){
+  [[ "$(yqg '.screenshots.enable')" == "true" ]] || { log "screenshots disabled"; return 0; }
+  [[ -s "$OUT/httpx.json" ]] || { log "shots: no live web services — skipping"; return 0; }
+  jq -r 'select((.url // "")|test("^https?://[^/[:space:]]\\S*$")) | .url' "$OUT/httpx.json" 2>/dev/null | sort -u > "$OUT/shot_urls.txt" || : > "$OUT/shot_urls.txt"
+  [[ -s "$OUT/shot_urls.txt" ]] || { log "shots: no urls — skipping"; return 0; }
+  mkdir -p "$OUT/screenshots"
+  log "gowitness (screenshots)…"
+  crun gowitness scan file -f "/data/out/$TS/shot_urls.txt" \
+    --screenshot-path "/data/out/$TS/screenshots" \
+    --write-jsonl --write-jsonl-file "/data/out/$TS/gowitness.jsonl" \
+    --threads "$(yqg '.screenshots.gowitness.workers')" \
+    --delay "$(yqg '.screenshots.gowitness.delay')" || mark_degraded gowitness $?
+  log "[✓] screenshots done."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge — normalize every tool's output into NDJSON + CSV (BACKSTAGE contract).
+# Invariant fields (source, observed_at, host/ip) match STRIP; SHOW adds mac/netbios.
+# ─────────────────────────────────────────────────────────────────────────────
+merge(){
+  local R="$OUT"
+  log "Merging outputs…"
+
+  # web_assets.ndjson + services.ndjson are produced by the normalizer (scripts/normalize.py):
+  #   services ← nmap.xml (service/product/version/extra_info/cpe separate) + masscan, one row per
+  #   (host,port,protocol). mac/netbios move to hosts.ndjson (6d); arp.tsv/nbt.tsv stay on disk
+  #   until then. (Stage 6: findings migrate to the normalizer next; until then it stays below.)
+
+  # findings.ndjson (unified nuclei + testssl) is produced by the normalizer
+  # (scripts/normalize.py). merge() now only builds the human CSV exports below.
+
+  # CSV exports — human-facing; NDJSON is the contract (skip sentinel lines)
+  [[ -s "$R/web_assets.ndjson" ]] && jq -r 'select(.message|not) | [.url,.ip_at_observation_time,.hostname_at_observation_time,.status,.title]|@csv' "$R/web_assets.ndjson" > "$R/web_assets.csv" || true
+  [[ -s "$R/services.ndjson"   ]] && jq -r 'select(.message|not) | [.ip_at_observation_time,.port,.protocol,.service,.product,.version]|@csv' "$R/services.ndjson" > "$R/open_ports.csv" || true
+  [[ -s "$R/findings.ndjson"   ]] && jq -r 'select(.message|not) | [.ip_at_observation_time,.port,.severity,.category,.cve_id,.title,.source_tool]|@csv' "$R/findings.ndjson" > "$R/findings_summary.csv" || true
+  [[ -s "$R/hosts.ndjson"      ]] && jq -r 'select(.message|not) | [.ip_at_observation_time,.mac,.netbios,.os_name,.is_private]|@csv' "$R/hosts.ndjson" > "$R/hosts.csv" || true
+  [[ -s "$R/tls.ndjson"        ]] && jq -r 'select(.message|not) | [.ip_at_observation_time,.port,.fingerprint_sha256,.subject_cn,.grade,.not_after]|@csv' "$R/tls.ndjson" > "$R/tls.csv" || true
+  log "[✓] Merge complete → $R"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalize — sensor-output/1.0 conformant NDJSON via scripts/normalize.py
+# (Python, stdlib, in the discovery container). Progressively takes streams over
+# from merge(); now owns all 5 streams (hosts/services/web_assets/tls/findings). Runs before merge (its CSV
+# reads its output).
+# ─────────────────────────────────────────────────────────────────────────────
+normalize(){
+  log "Normalizing → sensor-output/1.0…"
+  if crun discovery python3 /scripts/normalize.py \
+       --run-dir "/data/out/$TS" --scan-id "$SCAN_ID" --observed-at "$SCAN_ID"; then
+    log "[✓] Normalize done."
+  else
+    NORMALIZE_OK=0
+    log "[✗] Normalize FAILED — sensor-output streams may be missing/incomplete; run marked failed."
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config validation — fail fast on an invalid show.yaml (types/enums) before a
+# scan burns time. Hard errors abort; risky-but-valid values only warn.
+# ─────────────────────────────────────────────────────────────────────────────
+config_check(){
+  local ok=1 v g tok _sev
+  # positive integers (rates, concurrency, worker counts) — a bad value would reach the tool and, with
+  # failures now marked degraded rather than fatal, could silently under-scan
+  for g in .scan.masscan.rate .scan.httpx.rate_limit .scan.nuclei.rate_limit .scan.nuclei.concurrency .screenshots.gowitness.workers; do
+    v="$(yqg "$g")"
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 ]] || { log "config: ✗ $g must be a positive integer (got '$v')"; ok=0; }
+  done
+  v="$(yqg '.scan.masscan.rate')"; [[ "$v" =~ ^[0-9]+$ && "$v" -gt 100000 ]] && log "config: ⚠ scan.masscan.rate=$v is very high — can saturate links / trip IDS"
+  # non-negative integer (0 = no delay)
+  v="$(yqg '.screenshots.gowitness.delay')"; [[ "$v" =~ ^[0-9]+$ ]] || { log "config: ✗ .screenshots.gowitness.delay must be a non-negative integer (got '$v')"; ok=0; }
+  # nmap timing template + version-detection intensity (anything but full silently maps to --version-light)
+  v="$(yqg '.scan.nmap.timing')"; [[ "$v" =~ ^T[0-5]$ ]] || { log "config: ✗ scan.nmap.timing must be T0..T5 (got '$v')"; ok=0; }
+  v="$(yqg '.scan.nmap.version_intensity')"; [[ "$v" == "full" || "$v" == "light" ]] || { log "config: ✗ scan.nmap.version_intensity must be full|light (got '$v')"; ok=0; }
+  # booleans
+  for g in .scan.arp_scan.enable .scan.nbtscan.enable .scan.tls.testssl .screenshots.enable; do
+    v="$(yqg "$g")"; [[ "$v" == "true" || "$v" == "false" ]] || { log "config: ✗ $g must be true|false (got '$v')"; ok=0; }
+  done
+  # nuclei severities (daily + weekly): comma-separated, each token a valid nuclei severity — catch typos
+  # (e.g. "hihg") at config time rather than as a degraded nuclei run later
+  for g in .scan.nuclei.severity_daily .scan.nuclei.severity_weekly; do
+    v="$(yqg "$g")"
+    if [[ -z "$v" || "$v" == "null" ]]; then log "config: ✗ $g is empty"; ok=0
+    else
+      IFS=',' read -ra _sev <<<"$v"
+      for tok in "${_sev[@]}"; do
+        tok="${tok// /}"
+        [[ "$tok" =~ ^(info|low|medium|high|critical|unknown)$ ]] || { log "config: ✗ $g invalid severity '$tok' (want info|low|medium|high|critical|unknown)"; ok=0; }
+      done
+    fi
+  done
+  # masscan port specs — SHOW's downstream chain (nmap -sV, httpx/testssl/gowitness) is TCP-only, so a UDP
+  # spec (U:) would be discovered then mis-probed as TCP/web. Reject U:; allow bare ports / ranges / lists / T:.
+  for g in .scan.masscan.ports .scan.masscan.full_ports; do
+    v="$(yqg "$g")"
+    if   [[ "$v" == *U:* || "$v" == *u:* ]];  then log "config: ✗ $g uses a UDP spec (U:) — SHOW's scan chain is TCP-only"; ok=0
+    elif [[ ! "$v" =~ ^[0-9T:,-]+$ ]];        then log "config: ✗ $g invalid port spec (got '$v')"; ok=0; fi
+  done
+  if [[ "$ok" -eq 1 ]]; then log "config: OK"; return 0
+  else log "config: INVALID — fix show.yaml and re-run"; return 1; fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run manifest — legal/compliance record of what ran. Captures operator,
+# authorization attestation, target counts, duration, and which outputs were
+# produced (a proxy for per-phase success). Set SHOW_AUTHORIZED_BY to attribute.
+# ─────────────────────────────────────────────────────────────────────────────
+manifest(){
+  local profile="${1:-}" R="$OUT" finished dur authorized s c emitted counts status degraded_json _t
+  finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  dur=$(( $(date +%s) - START_EPOCH ))
+  authorized="${SHOW_AUTHORIZED_BY:-UNATTESTED}"
+  [[ "$authorized" == "UNATTESTED" ]] && log "manifest: ⚠ run not attributed — set SHOW_AUTHORIZED_BY=\"name / ticket\""
+  cnt(){ [[ -f "$1" ]] && { wc -l < "$1" | tr -d ' '; } || echo 0; }
+
+  # streams_emitted (files) + record_counts (real records = non-sentinel lines)
+  emitted="[]"; counts="{}"
+  for s in hosts services web_assets tls findings; do
+    [[ -f "$R/$s.ndjson" ]] || continue
+    c="$(jq -s '[.[]|select(.message|not)]|length' "$R/$s.ndjson" 2>/dev/null || echo 0)"
+    emitted="$(printf '%s' "$emitted" | jq --arg k "$s.ndjson" '. + [$k]')"
+    counts="$(printf '%s' "$counts" | jq --arg k "$s" --argjson v "${c:-0}" '. + {($k):$v}')"
+  done
+
+  # tools whose JSON the normalizer couldn't fully parse (malformed output) also degrade the run
+  if [[ -f "$R/.normalize_degraded" ]]; then
+    while IFS= read -r _t; do [[ -n "$_t" ]] && DEGRADED_TOOLS="${DEGRADED_TOOLS:+$DEGRADED_TOOLS }$_t"; done < "$R/.normalize_degraded"
+  fi
+  # status: a normalize failure dominates; else "degraded" if any primary tool errored; else "ok".
+  # (Without this, a masscan/httpx/nuclei crash would emit empty sentinels under a false status:"ok".)
+  if   [[ "${NORMALIZE_OK:-1}" -ne 1 ]]; then status="normalize_failed"
+  elif [[ -n "${DEGRADED_TOOLS// }" ]];  then status="degraded"
+  else                                        status="ok"; fi
+  # shellcheck disable=SC2086  # intentional word-split of the space-separated tool list
+  degraded_json="$(printf '%s\n' $DEGRADED_TOOLS | jq -R 'select(length>0)' | jq -s 'unique')"
+  [[ "$status" == "degraded" ]] && log "manifest: ⚠ degraded run — tool failure(s): $DEGRADED_TOOLS"
+
+  jq -n \
+    --arg module "SHOW" \
+    --arg scan_id "$SCAN_ID" \
+    --arg spec "sensor-output/1.0" \
+    --arg profile "$profile" \
+    --arg started "$SCAN_ID" \
+    --arg finished "$finished" \
+    --argjson duration_s "$dur" \
+    --arg operator "$(id -un 2>/dev/null || echo '?')@$(hostname 2>/dev/null || echo '?')" \
+    --arg authorized_by "$authorized" \
+    --argjson targets "$(cnt "$R/targets_all.txt")" \
+    --argjson ips "$(cnt "$R/in_ips.txt")" \
+    --argjson cidrs "$(cnt "$R/in_cidrs.txt")" \
+    --argjson hostnames "$(cnt "$R/in_hosts.txt")" \
+    --argjson emitted "$emitted" \
+    --argjson counts "$counts" \
+    --arg status "$status" \
+    --argjson degraded_tools "$degraded_json" \
+    '{source_module:$module, scan_id:$scan_id, spec_version:$spec, profile:$profile,
+      started_at:$started, finished_at:$finished, duration_seconds:$duration_s,
+      operator:$operator, authorized_by:$authorized_by, status:$status,
+      targets:{total:$targets, ips:$ips, cidrs:$cidrs, hostnames:$hostnames},
+      tool_versions:{}, streams_emitted:$emitted, record_counts:$counts, degraded_tools:$degraded_tools}' > "$R/run_manifest.json"
+  log "[✓] Run manifest → run_manifest.json (authorized_by: $authorized)"
+}
+
+usage(){
+  cat <<USAGE
+SHOW — Security Host Observation & Weakness Detection (internal network sensor)
+
+Setup (first run only):
+  showctl setup            Build discovery image + download Nuclei templates
+
+Scanning:
+  showctl discover         Discovery only (masscan → arp/nbt → nmap → httpx)
+  showctl run daily        Daily: discovery + nuclei (high/crit) + TLS + screenshots + merge
+  showctl run weekly       Weekly sweep: + full-port masscan, medium-severity nuclei
+
+Other:
+  showctl merge              Re-merge an existing run's outputs into NDJSON/CSV
+  showctl config-check       Validate show.yaml (types/enums) without scanning
+
+Targets: data/in/subnets.txt  (IP / CIDR / hostname, one per line)
+Output:  data/out/YYYYMMDDTHHMMSSZ/ (UTC)
+
+Notes:
+  - Needs Docker access (docker group, or sudo); the compose file grants the containers NET_RAW.
+  - If masscan can't auto-pick an interface, export SHOW_IFACE=eth0 first.
+  - Set SHOW_AUTHORIZED_BY="name / ticket" to record who authorized the scan (run_manifest.json).
+USAGE
+}
+
+# CLI dispatch — skipped when sourced for tests (SHOW_TEST_MODE=1) so `source showctl` starts no scan
+if [[ "${SHOW_TEST_MODE:-0}" != "1" ]]; then
+case "${1:-}" in
+  setup)    setup ;;
+  discover)
+    config_check || exit 1          # fail fast on bad config (as daily/weekly do)…
+    ensure_discovery_image          # …and on a missing discovery image, not as tool noise later
+    discover
+    # standalone discovery writes no manifest to carry status — surface a primary-tool failure via exit code
+    [[ -z "$DEGRADED_TOOLS" ]] || { log "discover: degraded — tool failure(s): $DEGRADED_TOOLS"; exit 1; }
+    ;;
+  run)
+    case "${2:-}" in
+      daily)
+        config_check || exit 1
+        ensure_nuclei_templates
+        ensure_discovery_image
+        discover
+        webscan "$(yqg '.scan.nuclei.severity_daily')"
+        tls
+        shots
+        normalize
+        merge
+        manifest daily
+        [[ "$NORMALIZE_OK" -eq 1 ]] || { log "run FAILED: normalization did not complete"; exit 1; }
+        ;;
+      weekly)
+        config_check || exit 1
+        ensure_nuclei_templates
+        ensure_discovery_image
+        discover sweep
+        webscan "$(yqg '.scan.nuclei.severity_weekly')"
+        tls
+        shots
+        normalize
+        merge
+        manifest weekly
+        [[ "$NORMALIZE_OK" -eq 1 ]] || { log "run FAILED: normalization did not complete"; exit 1; }
+        ;;
+      *) usage ;;
+    esac
+    ;;
+  merge)
+    # Re-merge an EXISTING run (given dir, else the latest populated one) — never the empty startup dir.
+    # Drop the empty startup dir FIRST so latest_run can't select the dir we just created this invocation.
+    rmdir "$OUT" 2>/dev/null || true
+    RUN="${2:-$(latest_run)}"
+    [[ -n "$RUN" && -d "$RUN" ]] || { log "merge: no existing run dir found (usage: showctl merge <dir>)"; exit 1; }
+    OUT="${RUN%/}"; TS="$(basename "$OUT")"
+    # Reuse the run's original scan_id from its manifest; if it never wrote one, derive it deterministically
+    # from the run-dir timestamp. Reset first — SCAN_ID is pre-set to "now" at startup, which would otherwise
+    # win and make re-merges non-idempotent (a fresh merge-time id instead of the run's own).
+    SCAN_ID=""
+    if [[ -f "$OUT/run_manifest.json" ]]; then SCAN_ID="$(jq -r '.scan_id // empty' "$OUT/run_manifest.json")"; fi
+    [[ -n "$SCAN_ID" ]] || SCAN_ID="$(printf '%s' "$TS" | sed -E 's/^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$/\1-\2-\3T\4:\5:\6Z/')"
+    log "merge: re-normalizing existing run $OUT (scan_id: $SCAN_ID)"
+    normalize
+    merge
+    [[ "$NORMALIZE_OK" -eq 1 ]] || { log "merge FAILED: normalization did not complete"; exit 1; }
+    # merge writes no manifest to carry status — surface a normalizer-degraded run via the exit code.
+    # (Use an `if`, not `[[ -f ]] && …`: on the clean path a false test would leave the branch's — and the
+    # script's — exit status at 1.)
+    if [[ -f "$OUT/.normalize_degraded" ]]; then
+      log "merge: degraded — unparseable tool output: $(tr '\n' ' ' <"$OUT/.normalize_degraded")"; exit 1
+    fi
+    ;;
+  config-check) config_check ;;
+  *)        usage ;;
+esac
+fi

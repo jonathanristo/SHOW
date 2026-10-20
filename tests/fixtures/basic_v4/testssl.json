@@ -1,0 +1,1 @@
+[{"id":"cert_fingerprintSHA256","ip":"10.0.1.5/10.0.1.5","port":"443","severity":"INFO","finding":"SHA256 AB:CD"},{"id":"BREACH","ip":"10.0.1.5/10.0.1.5","port":"443","severity":"MEDIUM","finding":"gzip"}]

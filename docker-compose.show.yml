@@ -1,0 +1,50 @@
+# SHOW — internal network sensor (core discovery/scan tools).
+
+volumes:
+  nuclei-templates:
+    external: true
+
+services:
+  # masscan + arp-scan + nbtscan — built locally (all Debian pkgs; no reliable single upstream image)
+  discovery:
+    build: ./docker/discovery
+    image: show/discovery:latest
+    network_mode: host                 # raw packets (masscan) + see the local L2 segment (arp-scan)
+    cap_add: ["NET_RAW", "NET_ADMIN"]
+    volumes:
+      - ./data:/data
+      - ./scripts:/scripts:ro          # normalize.py runs here (python3, stdlib)
+    working_dir: /data
+
+  nmap:
+    image: instrumentisto/nmap:latest
+    network_mode: host
+    cap_add: ["NET_RAW", "NET_ADMIN"]
+    volumes: ["./data:/data"]
+    working_dir: /data
+
+  httpx:
+    image: projectdiscovery/httpx:latest
+    environment:
+      - XDG_CONFIG_HOME=/data/.config
+    volumes: ["./data:/data"]
+    working_dir: /data
+
+  nuclei:
+    image: projectdiscovery/nuclei:latest
+    volumes:
+      - ./data:/data
+      - nuclei-templates:/root/nuclei-templates
+    working_dir: /data
+
+  testssl:
+    image: drwetter/testssl.sh:latest
+    platform: linux/amd64              # image is amd64-only: native on amd64, emulated on arm64
+    volumes: ["./data:/data"]
+    working_dir: /data
+
+  gowitness:
+    image: ghcr.io/sensepost/gowitness:latest
+    platform: linux/amd64              # image is amd64-only: native on amd64, emulated on arm64
+    volumes: ["./data:/data"]
+    working_dir: /data
